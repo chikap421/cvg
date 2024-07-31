@@ -1,7 +1,6 @@
 import math
 import argparse
 import numpy as np
-
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -25,14 +24,19 @@ class VQVAE(pl.LightningModule):
         self.post_vq_conv = SamePadConv3d(args.embedding_dim, args.n_hiddens, 1)
 
         self.codebook = Codebook(args.n_codes, args.embedding_dim)
+        self.text_encoder = nn.Embedding(args.n_codes, args.embedding_dim)
+        self.attention_layer = MultiHeadAttention(
+            shape=(args.sequence_length, args.resolution, args.resolution),
+            dim_q=args.embedding_dim, dim_kv=args.embedding_dim,
+            n_head=8, n_layer=4, causal=True,
+            attn_type='full', attn_kwargs=dict(attn_dropout=0.1)
+        )
         self.save_hyperparameters()
 
     @property
     def latent_shape(self):
-        input_shape = (self.args.sequence_length, self.args.resolution,
-                       self.args.resolution)
-        return tuple([s // d for s, d in zip(input_shape,
-                                             self.args.downsample)])
+        input_shape = (self.args.sequence_length, self.args.resolution, self.args.resolution)
+        return tuple([s // d for s, d in zip(input_shape, self.args.downsample)])
 
     def encode(self, x, include_embeddings=False):
         h = self.pre_vq_conv(self.encoder(x))
@@ -47,27 +51,66 @@ class VQVAE(pl.LightningModule):
         h = self.post_vq_conv(shift_dim(h, -1, 1))
         return self.decoder(h)
 
-    def forward(self, x):
-        z = self.pre_vq_conv(self.encoder(x))
+    def forward(self, ref_video, delta_caption):
+        # Encode the reference video
+        z = self.pre_vq_conv(self.encoder(ref_video))
         vq_output = self.codebook(z)
-        x_recon = self.decoder(self.post_vq_conv(vq_output['embeddings']))
-        recon_loss = F.mse_loss(x_recon, x) / 0.06
+        
+        # Process delta_caption to create an attention context
+        delta_context = self.process_delta_caption(delta_caption)
+        
+        # Combine encoded video with delta context using attention
+        combined_context = self.combine_with_attention(vq_output['embeddings'], delta_context)
+        
+        # Decode to generate the composite video
+        generated_video = self.decoder(self.post_vq_conv(combined_context))
+        
+        # Compute the reconstruction loss
+        recon_loss = F.mse_loss(generated_video, ref_video) / 0.06
 
-        return recon_loss, x_recon, vq_output
+        return recon_loss, generated_video, vq_output
+
+    def process_delta_caption(self, delta_caption):
+        # Assuming one-hot encoding for delta captions
+        delta_emb = F.one_hot(delta_caption, num_classes=self.args.n_codes).float()
+        return delta_emb
+
+    def combine_with_attention(self, video_emb, delta_context):
+        # Apply attention mechanism to combine video embeddings with delta context
+        video_emb = video_emb.flatten(start_dim=2)  # Flatten spatial dimensions
+        delta_context = delta_context.unsqueeze(1).repeat(1, video_emb.size(1), 1)  # Expand delta context
+        combined_context, _ = self.attention_layer(video_emb, delta_context, delta_context)
+        combined_context = combined_context.view_as(video_emb)  # Reshape back to original dimensions
+        return combined_context
 
     def training_step(self, batch, batch_idx):
-        x = batch['video']
-        recon_loss, _, vq_output = self.forward(x)
+        ref_video = batch['ref_video']
+        delta_caption = batch['delta_caption']
+        target_video = batch['target_video']
+
+        recon_loss, generated_video, vq_output = self.forward(ref_video, delta_caption)
         commitment_loss = vq_output['commitment_loss']
         loss = recon_loss + commitment_loss
+
+        self.log('train/recon_loss', recon_loss, prog_bar=True)
+        self.log('train/commitment_loss', commitment_loss, prog_bar=True)
+        self.log('train/loss', loss, prog_bar=True)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x = batch['video']
-        recon_loss, _, vq_output = self.forward(x)
+        ref_video = batch['ref_video']
+        delta_caption = batch['delta_caption']
+        target_video = batch['target_video']
+
+        recon_loss, generated_video, vq_output = self.forward(ref_video, delta_caption)
+
         self.log('val/recon_loss', recon_loss, prog_bar=True)
         self.log('val/perplexity', vq_output['perplexity'], prog_bar=True)
         self.log('val/commitment_loss', vq_output['commitment_loss'], prog_bar=True)
+        self.log('val/loss', recon_loss + vq_output['commitment_loss'], prog_bar=True)
+
+        return {'val_loss': recon_loss}
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=3e-4, betas=(0.9, 0.999))
@@ -80,6 +123,13 @@ class VQVAE(pl.LightningModule):
         parser.add_argument('--n_hiddens', type=int, default=240)
         parser.add_argument('--n_res_layers', type=int, default=4)
         parser.add_argument('--downsample', nargs='+', type=int, default=(4, 4, 4))
+        parser.add_argument('--sequence_length', type=int, default=16)
+        parser.add_argument('--resolution', type=int, default=128)
+        parser.add_argument('--batch_size', type=int, default=32)
+        parser.add_argument('--num_workers', type=int, default=8)
+        parser.add_argument('--max_steps', type=int, default=200000)
+        parser.add_argument('--gpus', type=int, default=1)
+        parser.add_argument('--data_format', type=str, default='custom_json', choices=['custom_json', 'hdf5'])
         return parser
 
 
@@ -120,6 +170,7 @@ class AttentionResidualBlock(nn.Module):
 
     def forward(self, x):
         return x + self.block(x)
+
 
 class Codebook(nn.Module):
     def __init__(self, n_codes, embedding_dim):
@@ -209,6 +260,7 @@ class Codebook(nn.Module):
         embeddings = F.embedding(encodings, self.embeddings)
         return embeddings
 
+
 class Encoder(nn.Module):
     def __init__(self, n_hiddens, n_res_layers, downsample):
         super().__init__()
@@ -269,7 +321,6 @@ class Decoder(nn.Module):
         return h
 
 
-# Does not support dilation
 class SamePadConv3d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, bias=True):
         super().__init__()
@@ -281,7 +332,7 @@ class SamePadConv3d(nn.Module):
         # assumes that the input shape is divisible by stride
         total_pad = tuple([k - s for k, s in zip(kernel_size, stride)])
         pad_input = []
-        for p in total_pad[::-1]: # reverse since F.pad starts from last dim
+        for p in total_pad[::-1]:  # reverse since F.pad starts from last dim
             pad_input.append((p // 2 + p % 2, p // 2))
         pad_input = sum(pad_input, tuple())
         self.pad_input = pad_input
@@ -303,7 +354,7 @@ class SamePadConvTranspose3d(nn.Module):
 
         total_pad = tuple([k - s for k, s in zip(kernel_size, stride)])
         pad_input = []
-        for p in total_pad[::-1]: # reverse since F.pad starts from last dim
+        for p in total_pad[::-1]:  # reverse since F.pad starts from last dim
             pad_input.append((p // 2 + p % 2, p // 2))
         pad_input = sum(pad_input, tuple())
         self.pad_input = pad_input
@@ -314,4 +365,3 @@ class SamePadConvTranspose3d(nn.Module):
 
     def forward(self, x):
         return self.convt(F.pad(x, self.pad_input))
-
